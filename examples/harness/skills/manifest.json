@@ -5,6 +5,21 @@
       "id": "factor_refinement",
       "description": "Refine one existing factor or propose one complementary factor.",
       "strategy_path": "factor_refinement/SKILL.md"
+    },
+    {
+      "id": "factor_discovery",
+      "description": "Explore and test a new factor family when the pool lacks diversity.",
+      "strategy_path": "factor_discovery/SKILL.md"
+    },
+    {
+      "id": "redundancy_control",
+      "description": "Diagnose redundant factors and replace the least complementary member.",
+      "strategy_path": "redundancy_control/SKILL.md"
+    },
+    {
+      "id": "complexity_control",
+      "description": "Simplify fragile factor expressions while preserving predictive signal.",
+      "strategy_path": "complexity_control/SKILL.md"
     }
   ]
 }

@@ -23,6 +23,8 @@ from .types import CompletionModel, MemoryEntry, Message, Skill, ToolSchema
 
 
 class HarnessComponent(StrEnum):
+    SKILL = "skill"
+    MEMORY = "memory"
     SKILL_DESCRIPTION = "skill_description"
     SKILL_STRATEGY = "skill_strategy"
     MEMORY_KEY = "memory_key"
@@ -737,6 +739,82 @@ class HarnessEditOptimizer:
         return updated, tuple(edits)
 
 
+class HarnessEvolutionOptimizer:
+    """Evolve both the contents and cardinality of skill and memory libraries."""
+
+    def __init__(
+        self,
+        model: CompletionModel,
+        history_provider: Callable[[], str] | None = None,
+        *,
+        max_changes: int = 4,
+    ) -> None:
+        self.model = model
+        self.history_provider = history_provider
+        self.max_changes = max_changes
+
+    def update(
+        self,
+        harness: Harness,
+        gradients: Sequence[AggregatedSemanticGradient],
+        *,
+        batch: AdvantageBatch,
+        attributions: Sequence[ComponentAttribution],
+    ) -> tuple[Harness, tuple[ParameterEdit, ...]]:
+        payload = _structured_completion(
+            self.model,
+            system=(
+                "You are HAMA's library-evolution optimizer. Improve the harness "
+                "from grounded rollout evidence. Update an existing text field "
+                "for a local correction; create a new skill when a distinct, "
+                "reusable procedure should be routed separately; create a memory "
+                "for a concrete factor edit and observed evaluation; remove only "
+                "a clearly harmful or duplicate item. Use concise snake_case IDs. "
+                f"Return at most {self.max_changes} atomic changes."
+            ),
+            prompt=json.dumps(
+                {
+                    "current_harness": _harness_payload(harness),
+                    "semantic_gradients": [
+                        {
+                            "component": item.parameter.component.value,
+                            "item_id": item.parameter.item_id,
+                            "feedback": item.feedback,
+                            "rationale": item.rationale,
+                            "weight": item.total_weight,
+                        }
+                        for item in gradients
+                    ],
+                    "trajectory": [
+                        {
+                            "step": record.step_index,
+                            "skill": record.trace.skill.id,
+                            "memory": [entry.id for entry in record.trace.retrieved_memory],
+                            "query": record.trace.memory_query,
+                            "action": str(record.trace.action),
+                            "reward": record.trace.reward,
+                            "advantage": record.advantage,
+                        }
+                        for record in batch.records
+                    ],
+                    "component_credit": [attribution_payload(item) for item in attributions],
+                    "recent_git_history": (
+                        self.history_provider() if self.history_provider else ""
+                    ),
+                },
+                ensure_ascii=False,
+                default=str,
+            ),
+            tool_name="submit_harness_changes",
+            tool_description="Return atomic library evolution operations.",
+            parameters=_evolution_schema(self.max_changes),
+        )
+        changes = payload.get("changes", [])
+        if not isinstance(changes, list):
+            raise TypeError("harness changes must be a list")
+        return _apply_library_changes(harness, changes[: self.max_changes])
+
+
 def optimize_harness(
     *,
     harness: Harness,
@@ -763,14 +841,19 @@ def optimize_harness_with_attribution(
     batch: AdvantageBatch,
     attributor: ComponentAttributor,
     semantic_engine: ConflictAwareSemanticGradientEngine,
-    edit_optimizer: HarnessEditOptimizer,
+    edit_optimizer: HarnessEditOptimizer | HarnessEvolutionOptimizer,
 ) -> AttributedHarnessOptimizationResult:
     """Run prefill attribution, conflict-aware aggregation, and atomic edits."""
 
     attributions = attributor.attribute(batch)
     proposals = semantic_engine.generate(harness, attributions)
     selected = semantic_engine.select(proposals)
-    updated, edits = edit_optimizer.update(harness, selected)
+    if isinstance(edit_optimizer, HarnessEvolutionOptimizer):
+        updated, edits = edit_optimizer.update(
+            harness, selected, batch=batch, attributions=attributions
+        )
+    else:
+        updated, edits = edit_optimizer.update(harness, selected)
     return AttributedHarnessOptimizationResult(
         harness=updated,
         attributions=attributions,
@@ -778,6 +861,101 @@ def optimize_harness_with_attribution(
         selected_gradients=selected,
         edits=edits,
     )
+
+
+def _harness_payload(harness: Harness) -> dict[str, Any]:
+    return {
+        "skills": [
+            {"id": item.id, "description": item.description, "strategy": item.strategy}
+            for item in harness.skills.skills
+        ],
+        "memory": [
+            {
+                "id": item.id,
+                "key": item.key,
+                "factor_edit": item.factor_edit,
+                "evaluation": dict(item.evaluation),
+                "value": item.value,
+            }
+            for item in harness.memory.entries
+        ],
+    }
+
+
+def _evolution_schema(max_changes: int) -> dict[str, Any]:
+    return {
+        "type": "object",
+        "properties": {
+            "changes": {
+                "type": "array",
+                "maxItems": max_changes,
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["update_parameter", "upsert_skill", "upsert_memory", "remove_skill", "remove_memory"],
+                        },
+                        "component": {"type": "string"},
+                        "item_id": {"type": "string"},
+                        "updated_text": {"type": "string"},
+                        "description": {"type": "string"},
+                        "strategy": {"type": "string"},
+                        "key": {"type": "string"},
+                        "factor_edit": {"type": "string"},
+                        "evaluation": {"type": "object"},
+                        "value": {"type": "string"},
+                    },
+                    "required": ["operation", "item_id"],
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["changes"],
+        "additionalProperties": False,
+    }
+
+
+def _apply_library_changes(
+    harness: Harness, changes: Sequence[Mapping[str, Any]]
+) -> tuple[Harness, tuple[ParameterEdit, ...]]:
+    skills = {item.id: item for item in harness.skills.skills}
+    memory = {item.id: item for item in harness.memory.entries}
+    edits: list[ParameterEdit] = []
+    for change in changes:
+        operation, item_id = str(change["operation"]), str(change["item_id"]).strip()
+        if not item_id:
+            continue
+        if operation == "update_parameter":
+            parameter = ParameterRef(HarnessComponent(str(change["component"])), item_id)
+            current = Harness(SkillLibrary(tuple(skills.values())), MemoryBank(tuple(memory.values())))
+            before = _get_parameter(current, parameter)
+            after = str(change.get("updated_text", "")).strip()
+            current = _set_parameter(current, parameter, after)
+            skills = {item.id: item for item in current.skills.skills}
+            memory = {item.id: item for item in current.memory.entries}
+            edits.append(ParameterEdit(parameter, before, after))
+        elif operation == "upsert_skill":
+            after_skill = Skill(item_id, str(change.get("description", "")).strip(), str(change.get("strategy", "")).strip())
+            if not after_skill.description or not after_skill.strategy:
+                continue
+            before = json.dumps(skills[item_id].__dict__, ensure_ascii=False) if item_id in skills else ""
+            skills[item_id] = after_skill
+            edits.append(ParameterEdit(ParameterRef(HarnessComponent.SKILL, item_id), before, json.dumps(after_skill.__dict__, ensure_ascii=False)))
+        elif operation == "upsert_memory":
+            after_memory = MemoryEntry(item_id, str(change.get("key", "")).strip(), str(change.get("factor_edit", "")).strip(), change.get("evaluation", {}), str(change.get("value", "")).strip())
+            if not after_memory.key or not after_memory.value:
+                continue
+            before = json.dumps(memory[item_id].__dict__, ensure_ascii=False, default=str) if item_id in memory else ""
+            memory[item_id] = after_memory
+            edits.append(ParameterEdit(ParameterRef(HarnessComponent.MEMORY, item_id), before, json.dumps(after_memory.__dict__, ensure_ascii=False, default=str)))
+        elif operation == "remove_skill" and item_id in skills and len(skills) > 1:
+            before = json.dumps(skills.pop(item_id).__dict__, ensure_ascii=False)
+            edits.append(ParameterEdit(ParameterRef(HarnessComponent.SKILL, item_id), before, ""))
+        elif operation == "remove_memory" and item_id in memory:
+            before = json.dumps(memory.pop(item_id).__dict__, ensure_ascii=False, default=str)
+            edits.append(ParameterEdit(ParameterRef(HarnessComponent.MEMORY, item_id), before, ""))
+    return Harness(SkillLibrary(tuple(skills.values())), MemoryBank(tuple(memory.values()))), tuple(edits)
 
 
 def _trajectory_gradient(

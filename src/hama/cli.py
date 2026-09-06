@@ -14,7 +14,7 @@ from .evaluation import evaluate_policy
 from .model import Model
 from .optimization import (
     ConflictAwareSemanticGradientEngine,
-    HarnessEditOptimizer,
+    HarnessEvolutionOptimizer,
 )
 from .persistence import (
     factor_pool_from_list,
@@ -179,7 +179,11 @@ def _train(config: Mapping[str, Any], config_dir: Path) -> None:
                 ),
                 min_score=float(training.get("min_gradient_score", 0.0)),
             ),
-            edit_optimizer=HarnessEditOptimizer(model, harness_repository.history),
+            edit_optimizer=HarnessEvolutionOptimizer(
+                model,
+                harness_repository.history,
+                max_changes=int(training.get("max_harness_changes", 4)),
+            ),
             config=TrainingConfig(
                 rounds=int(training["rounds"]),
                 gamma=float(training.get("gamma", 1.0)),

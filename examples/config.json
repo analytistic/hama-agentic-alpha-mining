@@ -32,7 +32,8 @@
     "conflict_penalty": 1.0,
     "max_correction_evidence": 6,
     "max_preservation_evidence": 3,
-    "min_gradient_score": 0.0
+    "min_gradient_score": 0.0,
+    "max_harness_changes": 4
   },
   "environment": {
     "horizon": 3,

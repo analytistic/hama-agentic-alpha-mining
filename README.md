@@ -81,3 +81,9 @@ transition, factor-pool edit, reward, return, EMA baseline, advantage,
 leave-one-component-out attribution, semantic proposal, applied text diff, and
 the final test metrics. It needs no server and can combine consecutive run
 directories. TensorBoard logging remains optional and is disabled by default.
+
+The training CLI uses `HarnessEvolutionOptimizer`: one round may update an
+existing parameter, add or replace a complete skill or memory entry, or remove
+a harmful duplicate. Thus the cardinalities of both the skill library and the
+memory bank can evolve. The example harness starts with several routed skills;
+outcome-grounded memories are accumulated from rollout evidence.

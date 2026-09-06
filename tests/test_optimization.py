@@ -10,6 +10,7 @@ from hama import (
     FactorEditOperation,
     Harness,
     HarnessEditOptimizer,
+    HarnessEvolutionOptimizer,
     HarnessTrace,
     MarketState,
     MemoryBank,
@@ -359,6 +360,53 @@ def test_prefill_attribution_and_conflict_aware_update():
     assert result.harness.skills.load("skill-1").strategy == (
         "Backtest multiple horizons and submit the most stable one."
     )
+
+
+class LibraryEvolutionModel:
+    def complete(self, messages, tools):
+        assert tools[0]["function"]["name"] == "submit_harness_changes"
+        return Message(
+            role="assistant",
+            tool_calls=[
+                ToolCall(
+                    "evolve",
+                    "submit_harness_changes",
+                    {
+                        "changes": [
+                            {
+                                "operation": "upsert_skill",
+                                "item_id": "redundancy_control",
+                                "description": "Reject redundant factor candidates.",
+                                "strategy": "Compare the candidate with every pool member.",
+                            },
+                            {
+                                "operation": "upsert_memory",
+                                "item_id": "failed_short_momentum",
+                                "key": "short momentum failure",
+                                "factor_edit": "add five-day momentum",
+                                "evaluation": {"reward": -0.02},
+                                "value": "Short momentum degraded the pool in this split.",
+                            },
+                        ]
+                    },
+                )
+            ],
+        )
+
+
+def test_evolution_optimizer_can_expand_skill_and_memory_libraries():
+    batch, skill, memory = make_batch()
+    harness = Harness(SkillLibrary((skill,)), MemoryBank((memory,)))
+    updated, edits = HarnessEvolutionOptimizer(LibraryEvolutionModel()).update(
+        harness, (), batch=batch, attributions=()
+    )
+
+    assert updated.skills.load("redundancy_control").strategy.startswith("Compare")
+    assert {entry.id for entry in updated.memory.entries} == {
+        "memory-1",
+        "failed_short_momentum",
+    }
+    assert [edit.parameter.component.value for edit in edits] == ["skill", "memory"]
 
 
 def test_render_prefill_masks_only_selected_component():

@@ -1,0 +1,14 @@
+{
+  "format": "hama-memory-v1",
+  "memory": [
+    {
+      "id": "momentum_horizon_case",
+      "key": "momentum horizon stability and turnover",
+      "factor_edit": "replace short-horizon momentum with a valid Qlib expression such as Ref($close, 20) / $close - 1",
+      "evaluation": {
+        "observation": "Longer horizons can reduce noise but must be re-evaluated on the active split."
+      },
+      "value": "Compare several horizons and retain the candidate with stable IC and low redundancy."
+    }
+  ]
+}

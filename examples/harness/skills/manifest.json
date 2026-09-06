@@ -1,0 +1,10 @@
+{
+  "format": "hama-skills-v1",
+  "skills": [
+    {
+      "id": "factor_refinement",
+      "description": "Refine one existing factor or propose one complementary factor.",
+      "strategy_path": "factor_refinement/SKILL.md"
+    }
+  ]
+}

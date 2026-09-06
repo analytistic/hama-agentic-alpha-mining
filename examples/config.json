@@ -1,0 +1,78 @@
+{
+  "task": "Improve the current alpha-factor pool with one supported edit per state.",
+  "harness_path": "harness",
+  "output_dir": "hama-output",
+  "model": {
+    "name": "deepseek-chat",
+    "base_url": "https://api.deepseek.com/v1",
+    "timeout": 180,
+    "max_retries": 3,
+    "retry_backoff": 2,
+    "temperature": 0.7,
+    "max_tokens": 2048
+  },
+  "prefill": {
+    "model": "/path/to/Qwen3-VL-2B-Instruct",
+    "device_map": "auto",
+    "torch_dtype": "auto",
+    "max_length": 8192
+  },
+  "agent": {
+    "max_steps": 50,
+    "max_analysis_calls_per_state": 5,
+    "system_prompt": "You are an agentic alpha-mining researcher."
+  },
+  "training": {
+    "rounds": 5,
+    "gamma": 1.0,
+    "baseline_update_rate": 0.1,
+    "baseline_initial_value": 0.0,
+    "max_rollout_attempts": 2,
+    "tensorboard": false,
+    "conflict_penalty": 1.0,
+    "max_correction_evidence": 6,
+    "max_preservation_evidence": 3,
+    "min_gradient_score": 0.0
+  },
+  "environment": {
+    "horizon": 3,
+    "redundancy_threshold": 0.7,
+    "exploration_acceptance": 0.05,
+    "tool_timeout": 60.0
+  },
+  "qlib": {
+    "provider_uri": "/path/to/qlib_data/cn_data",
+    "instruments": "csi500",
+    "region": "cn",
+    "label": "Ref($close, -1) / $close - 1",
+    "score_metric": "ic",
+    "portfolio": {
+      "top_k": 50,
+      "annualization_factor": 252,
+      "buy_cost": 0.0005,
+      "sell_cost": 0.001
+    },
+    "splits": {
+      "train": {
+        "start_time": "2010-01-01",
+        "end_time": "2017-12-31"
+      },
+      "valid": {
+        "start_time": "2018-01-01",
+        "end_time": "2019-12-31"
+      },
+      "test": {
+        "start_time": "2020-01-01",
+        "end_time": "2022-12-31"
+      }
+    }
+  },
+  "initial_factor_pool": [],
+  "market_information": {
+    "universe": "CSI500"
+  },
+  "evaluation": {
+    "num_rollouts": 4,
+    "gamma": 1.0
+  }
+}

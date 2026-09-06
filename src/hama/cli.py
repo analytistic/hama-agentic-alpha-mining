@@ -29,7 +29,7 @@ from .prefill import QwenPrefillScorer
 from .qlib_evaluator import QlibEvaluatorConfig, QlibFactorEvaluator
 from .report import build_training_report
 from .repository import HarnessRepository
-from .training import AttributedHamaTrainer, TrainingConfig
+from .training import HamaTrainer, TrainingConfig
 from .types import MarketState
 
 
@@ -132,7 +132,7 @@ def _train(config: Mapping[str, Any], config_dir: Path) -> None:
         prefill_scorer = _prefill_scorer(config)
         harness_repository = HarnessRepository(output_dir / "harness-repo")
         harness_repository.initialize(harness)
-        trainer = AttributedHamaTrainer(
+        trainer = HamaTrainer(
             harness=harness,
             initial_state=state,
             task=config.get("task", "Improve the current alpha-factor pool."),

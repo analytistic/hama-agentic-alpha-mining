@@ -7,7 +7,6 @@ from collections import defaultdict
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, replace
 from enum import StrEnum
-from statistics import fmean
 from typing import Any, Callable
 
 from .attribution import (
@@ -17,7 +16,7 @@ from .attribution import (
     InvocationRef,
     attribution_payload,
 )
-from .advantage import AdvantageBatch, AdvantageRecord
+from .advantage import AdvantageBatch
 from .harness import Harness, MemoryBank, SkillLibrary
 from .types import CompletionModel, MemoryEntry, Message, Skill, ToolSchema
 
@@ -37,36 +36,6 @@ class ParameterRef:
 
     component: HarnessComponent
     item_id: str
-
-
-@dataclass(frozen=True)
-class SemanticGradient:
-    """One trace-attributed natural-language gradient."""
-
-    parameter: ParameterRef
-    diagnosis: str
-    feedback: str
-    advantage: float
-    rollout_index: int
-    step_index: int
-
-    @property
-    def weight(self) -> float:
-        return abs(self.advantage)
-
-
-@dataclass(frozen=True)
-class TrajectorySemanticGradient:
-    """One parameter-level conclusion formed within a single rollout."""
-
-    rollout_index: int
-    parameter: ParameterRef
-    feedback: str
-    rationale: str
-    step_indices: tuple[int, ...]
-    source_count: int
-    total_weight: float
-    mean_advantage: float
 
 
 @dataclass(frozen=True)
@@ -92,15 +61,6 @@ class ParameterEdit:
 
 
 @dataclass(frozen=True)
-class HarnessOptimizationResult:
-    harness: Harness
-    gradients: tuple[SemanticGradient, ...]
-    trajectory_gradients: tuple[TrajectorySemanticGradient, ...]
-    aggregated_gradients: tuple[AggregatedSemanticGradient, ...]
-    edits: tuple[ParameterEdit, ...]
-
-
-@dataclass(frozen=True)
 class AtomicGradientProposal:
     """One scored, single-parameter semantic revision direction."""
 
@@ -114,7 +74,7 @@ class AtomicGradientProposal:
 
 
 @dataclass(frozen=True)
-class AttributedHarnessOptimizationResult:
+class HarnessOptimizationResult:
     """Artifacts produced by the prefill-attributed optimizer."""
 
     harness: Harness
@@ -325,420 +285,6 @@ class ConflictAwareSemanticGradientEngine:
         return tuple(selected)
 
 
-class SemanticGradientEngine:
-    """Generate segment gradients, then aggregate trajectory-first."""
-
-    def __init__(
-        self,
-        model: CompletionModel,
-        *,
-        min_abs_advantage: float = 1e-6,
-    ) -> None:
-        if min_abs_advantage < 0.0:
-            raise ValueError("min_abs_advantage must be non-negative")
-        self.model = model
-        self.min_abs_advantage = min_abs_advantage
-
-    def generate(self, record: AdvantageRecord) -> tuple[SemanticGradient, ...]:
-        """Generate gradients only for parameters on the realized trace."""
-
-        if abs(record.advantage) < self.min_abs_advantage:
-            return ()
-        allowed = _trace_parameters(record)
-        payload = _structured_completion(
-            self.model,
-            system=(
-                "You are the semantic-gradient engine for HAMA. Trace the "
-                "realized outcome backward and return concise, actionable "
-                "natural-language gradients only for responsible parameters. "
-                "Attribute skill-selection errors to skill descriptions; "
-                "execution or query-construction errors to skill strategies; "
-                "retrieval mismatches to memory keys; and inaccurate empirical "
-                "guidance to memory values. The query and retrieved result are "
-                "intermediate variables, never optimization parameters. A "
-                "negative advantage calls for correction; a positive advantage "
-                "calls for preserving and sharpening what caused success."
-            ),
-            prompt=json.dumps(
-                {
-                    "trace": _record_payload(record),
-                    "allowed_parameters": [
-                        {
-                            "component": parameter.component.value,
-                            "item_id": parameter.item_id,
-                            "current_value": _trace_parameter_value(record, parameter),
-                        }
-                        for parameter in allowed
-                    ],
-                },
-                ensure_ascii=False,
-                default=str,
-            ),
-            tool_name="submit_semantic_gradients",
-            tool_description="Return trace-attributed semantic gradients.",
-            parameters={
-                "type": "object",
-                "properties": {
-                    "gradients": {
-                        "type": "array",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "component": {
-                                    "type": "string",
-                                    "enum": [item.value for item in HarnessComponent],
-                                },
-                                "item_id": {"type": "string"},
-                                "diagnosis": {"type": "string"},
-                                "feedback": {"type": "string"},
-                            },
-                            "required": [
-                                "component",
-                                "item_id",
-                                "diagnosis",
-                                "feedback",
-                            ],
-                            "additionalProperties": False,
-                        },
-                    }
-                },
-                "required": ["gradients"],
-                "additionalProperties": False,
-            },
-        )
-        raw_gradients = payload.get("gradients")
-        if not isinstance(raw_gradients, list):
-            raise TypeError("semantic-gradient engine returned no gradients list")
-
-        allowed_set = set(allowed)
-        seen: set[ParameterRef] = set()
-        gradients: list[SemanticGradient] = []
-        for item in raw_gradients:
-            if not isinstance(item, dict):
-                raise TypeError("each semantic gradient must be an object")
-            parameter = ParameterRef(
-                HarnessComponent(str(item["component"])),
-                str(item["item_id"]),
-            )
-            if parameter not in allowed_set:
-                raise ValueError(f"gradient targets an untraced parameter: {parameter}")
-            if parameter in seen:
-                raise ValueError(f"duplicate gradient for parameter: {parameter}")
-            diagnosis = str(item["diagnosis"]).strip()
-            feedback = str(item["feedback"]).strip()
-            if not diagnosis or not feedback:
-                raise ValueError("semantic diagnosis and feedback must not be empty")
-            seen.add(parameter)
-            gradients.append(
-                SemanticGradient(
-                    parameter=parameter,
-                    diagnosis=diagnosis,
-                    feedback=feedback,
-                    advantage=record.advantage,
-                    rollout_index=record.rollout_index,
-                    step_index=record.step_index,
-                )
-            )
-        return tuple(gradients)
-
-    def generate_batch(
-        self,
-        batch: AdvantageBatch,
-    ) -> tuple[SemanticGradient, ...]:
-        return tuple(
-            gradient for record in batch.records for gradient in self.generate(record)
-        )
-
-    def aggregate_trajectories(
-        self,
-        gradients: Sequence[SemanticGradient],
-    ) -> tuple[TrajectorySemanticGradient, ...]:
-        """Consolidate ordered segments inside each rollout before grouping."""
-
-        grouped: dict[int, list[SemanticGradient]] = defaultdict(list)
-        for gradient in gradients:
-            grouped[gradient.rollout_index].append(gradient)
-
-        results: list[TrajectorySemanticGradient] = []
-        for rollout_index in sorted(grouped):
-            items = sorted(
-                grouped[rollout_index],
-                key=lambda item: (item.step_index, item.parameter),
-            )
-            if len(items) == 1:
-                results.append(_trajectory_gradient(items[0].parameter, items))
-                continue
-
-            payload = _structured_completion(
-                self.model,
-                system=(
-                    "You are HAMA's within-trajectory semantic-gradient "
-                    "aggregator. Read all ordered segment gradients from exactly "
-                    "one rollout as correlated evidence. Resolve earlier and "
-                    "later outcomes, avoid counting repeated appearances as "
-                    "independent votes, and return at most one conclusion per "
-                    "affected parameter. Omit parameters with no net actionable "
-                    "evidence. Do not edit parameter text."
-                ),
-                prompt=json.dumps(
-                    {
-                        "rollout_index": rollout_index,
-                        "ordered_segment_gradients": [
-                            {
-                                "step_index": item.step_index,
-                                "parameter": {
-                                    "component": item.parameter.component.value,
-                                    "item_id": item.parameter.item_id,
-                                },
-                                "diagnosis": item.diagnosis,
-                                "feedback": item.feedback,
-                                "advantage": item.advantage,
-                                "weight": item.weight,
-                            }
-                            for item in items
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                tool_name="submit_trajectory_gradients",
-                tool_description=(
-                    "Return rollout-level semantic gradients after consolidating "
-                    "all ordered segments."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "gradients": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "component": {
-                                        "type": "string",
-                                        "enum": [
-                                            item.value for item in HarnessComponent
-                                        ],
-                                    },
-                                    "item_id": {"type": "string"},
-                                    "rationale": {"type": "string"},
-                                    "feedback": {"type": "string"},
-                                },
-                                "required": [
-                                    "component",
-                                    "item_id",
-                                    "rationale",
-                                    "feedback",
-                                ],
-                                "additionalProperties": False,
-                            },
-                        }
-                    },
-                    "required": ["gradients"],
-                    "additionalProperties": False,
-                },
-            )
-            raw_gradients = payload.get("gradients")
-            if not isinstance(raw_gradients, list):
-                raise TypeError("trajectory aggregator returned no gradients list")
-            allowed = {item.parameter for item in items}
-            seen: set[ParameterRef] = set()
-            for raw in raw_gradients:
-                if not isinstance(raw, dict):
-                    raise TypeError("each trajectory gradient must be an object")
-                parameter = ParameterRef(
-                    HarnessComponent(str(raw["component"])),
-                    str(raw["item_id"]),
-                )
-                if parameter not in allowed:
-                    raise ValueError(
-                        f"trajectory gradient targets an untraced parameter: {parameter}"
-                    )
-                if parameter in seen:
-                    raise ValueError(
-                        f"duplicate trajectory gradient for parameter: {parameter}"
-                    )
-                seen.add(parameter)
-                feedback = str(raw["feedback"]).strip()
-                rationale = str(raw["rationale"]).strip()
-                if not feedback or not rationale:
-                    raise ValueError("trajectory gradient must not be empty")
-                parameter_items = [
-                    item for item in items if item.parameter == parameter
-                ]
-                results.append(
-                    _trajectory_gradient(
-                        parameter,
-                        parameter_items,
-                        feedback=feedback,
-                        rationale=rationale,
-                    )
-                )
-        return tuple(results)
-
-    def aggregate_rollouts(
-        self,
-        gradients: Sequence[TrajectorySemanticGradient],
-    ) -> tuple[AggregatedSemanticGradient, ...]:
-        """Aggregate one conclusion per rollout across independent rollouts."""
-
-        grouped: dict[ParameterRef, list[TrajectorySemanticGradient]] = defaultdict(
-            list
-        )
-        for gradient in gradients:
-            grouped[gradient.parameter].append(gradient)
-
-        results: list[AggregatedSemanticGradient] = []
-        for parameter in sorted(grouped):
-            items = sorted(grouped[parameter], key=lambda item: item.rollout_index)
-            rollout_indices = [item.rollout_index for item in items]
-            if len(rollout_indices) != len(set(rollout_indices)):
-                raise ValueError(
-                    f"multiple trajectory conclusions for one rollout: {parameter}"
-                )
-            total_weight = sum(item.total_weight for item in items)
-            segment_count = sum(item.source_count for item in items)
-            if len(items) == 1:
-                results.append(
-                    AggregatedSemanticGradient(
-                        parameter=parameter,
-                        feedback=items[0].feedback,
-                        rationale=items[0].rationale,
-                        source_count=1,
-                        segment_count=segment_count,
-                        total_weight=total_weight,
-                    )
-                )
-                continue
-
-            payload = _structured_completion(
-                self.model,
-                system=(
-                    "You are HAMA's cross-rollout semantic-gradient aggregator. "
-                    "Each input is already one consolidated conclusion from an "
-                    "independent rollout. Treat each rollout as one evidence "
-                    "unit, resolve agreement and conflict using its signed mean "
-                    "advantage, and emit one concise parameter gradient. Do not "
-                    "recount its underlying segments as independent votes and "
-                    "do not edit parameter text."
-                ),
-                prompt=json.dumps(
-                    {
-                        "parameter": {
-                            "component": parameter.component.value,
-                            "item_id": parameter.item_id,
-                        },
-                        "trajectory_gradients": [
-                            {
-                                "rollout_index": item.rollout_index,
-                                "rationale": item.rationale,
-                                "feedback": item.feedback,
-                                "mean_advantage": item.mean_advantage,
-                                "evidence_weight": item.total_weight,
-                                "step_indices": item.step_indices,
-                            }
-                            for item in items
-                        ],
-                    },
-                    ensure_ascii=False,
-                ),
-                tool_name="submit_group_gradient",
-                tool_description=(
-                    "Return one gradient consolidated across independent rollouts."
-                ),
-                parameters={
-                    "type": "object",
-                    "properties": {
-                        "rationale": {"type": "string"},
-                        "feedback": {"type": "string"},
-                    },
-                    "required": ["rationale", "feedback"],
-                    "additionalProperties": False,
-                },
-            )
-            feedback = str(payload["feedback"]).strip()
-            rationale = str(payload["rationale"]).strip()
-            if not feedback or not rationale:
-                raise ValueError("group semantic gradient must not be empty")
-            results.append(
-                AggregatedSemanticGradient(
-                    parameter=parameter,
-                    feedback=feedback,
-                    rationale=rationale,
-                    source_count=len(items),
-                    segment_count=segment_count,
-                    total_weight=total_weight,
-                )
-            )
-        return tuple(results)
-
-
-class HarnessEditOptimizer:
-    """Apply aggregated gradients as one atomic edit per parameter."""
-
-    def __init__(
-        self,
-        model: CompletionModel,
-        history_provider: Callable[[], str] | None = None,
-    ) -> None:
-        self.model = model
-        self.history_provider = history_provider
-
-    def update(
-        self,
-        harness: Harness,
-        gradients: Sequence[AggregatedSemanticGradient],
-    ) -> tuple[Harness, tuple[ParameterEdit, ...]]:
-        updated = harness
-        edits: list[ParameterEdit] = []
-        seen: set[ParameterRef] = set()
-        for gradient in gradients:
-            if gradient.parameter in seen:
-                raise ValueError(
-                    f"optimizer received duplicate parameter: {gradient.parameter}"
-                )
-            seen.add(gradient.parameter)
-            before = _get_parameter(updated, gradient.parameter)
-            payload = _structured_completion(
-                self.model,
-                system=(
-                    "You are the HAMA edit-optimizer engine. Apply the supplied "
-                    "aggregated semantic gradient to exactly one current text "
-                    "parameter. Preserve useful content, make the smallest "
-                    "coherent update, and return only the complete replacement "
-                    "text for that parameter."
-                ),
-                prompt=json.dumps(
-                    {
-                        "parameter": {
-                            "component": gradient.parameter.component.value,
-                            "item_id": gradient.parameter.item_id,
-                        },
-                        "current_value": before,
-                        "aggregated_gradient": gradient.feedback,
-                        "rationale": gradient.rationale,
-                        "recent_edit_history": (
-                            self.history_provider() if self.history_provider else ""
-                        ),
-                    },
-                    ensure_ascii=False,
-                ),
-                tool_name="submit_parameter_edit",
-                tool_description="Return the complete updated parameter text.",
-                parameters={
-                    "type": "object",
-                    "properties": {"updated_text": {"type": "string"}},
-                    "required": ["updated_text"],
-                    "additionalProperties": False,
-                },
-            )
-            after = str(payload["updated_text"]).strip()
-            if not after:
-                raise ValueError("updated harness parameter must not be empty")
-            updated = _set_parameter(updated, gradient.parameter, after)
-            edits.append(ParameterEdit(gradient.parameter, before, after))
-        return updated, tuple(edits)
-
-
 class HarnessEvolutionOptimizer:
     """Evolve both the contents and cardinality of skill and memory libraries."""
 
@@ -815,46 +361,23 @@ class HarnessEvolutionOptimizer:
         return _apply_library_changes(harness, changes[: self.max_changes])
 
 
-def optimize_harness(
-    *,
-    harness: Harness,
-    batch: AdvantageBatch,
-    semantic_engine: SemanticGradientEngine,
-    edit_optimizer: HarnessEditOptimizer,
-) -> HarnessOptimizationResult:
-    gradients = semantic_engine.generate_batch(batch)
-    trajectory_gradients = semantic_engine.aggregate_trajectories(gradients)
-    aggregated = semantic_engine.aggregate_rollouts(trajectory_gradients)
-    updated, edits = edit_optimizer.update(harness, aggregated)
-    return HarnessOptimizationResult(
-        updated,
-        gradients,
-        trajectory_gradients,
-        aggregated,
-        edits,
-    )
-
-
 def optimize_harness_with_attribution(
     *,
     harness: Harness,
     batch: AdvantageBatch,
     attributor: ComponentAttributor,
     semantic_engine: ConflictAwareSemanticGradientEngine,
-    edit_optimizer: HarnessEditOptimizer | HarnessEvolutionOptimizer,
-) -> AttributedHarnessOptimizationResult:
+    edit_optimizer: HarnessEvolutionOptimizer,
+) -> HarnessOptimizationResult:
     """Run prefill attribution, conflict-aware aggregation, and atomic edits."""
 
     attributions = attributor.attribute(batch)
     proposals = semantic_engine.generate(harness, attributions)
     selected = semantic_engine.select(proposals)
-    if isinstance(edit_optimizer, HarnessEvolutionOptimizer):
-        updated, edits = edit_optimizer.update(
-            harness, selected, batch=batch, attributions=attributions
-        )
-    else:
-        updated, edits = edit_optimizer.update(harness, selected)
-    return AttributedHarnessOptimizationResult(
+    updated, edits = edit_optimizer.update(
+        harness, selected, batch=batch, attributions=attributions
+    )
+    return HarnessOptimizationResult(
         harness=updated,
         attributions=attributions,
         proposals=proposals,
@@ -958,30 +481,6 @@ def _apply_library_changes(
     return Harness(SkillLibrary(tuple(skills.values())), MemoryBank(tuple(memory.values()))), tuple(edits)
 
 
-def _trajectory_gradient(
-    parameter: ParameterRef,
-    items: Sequence[SemanticGradient],
-    *,
-    feedback: str | None = None,
-    rationale: str | None = None,
-) -> TrajectorySemanticGradient:
-    if not items:
-        raise ValueError("trajectory gradient requires at least one segment")
-    rollout_indices = {item.rollout_index for item in items}
-    if len(rollout_indices) != 1:
-        raise ValueError("trajectory gradient cannot mix rollouts")
-    if any(item.parameter != parameter for item in items):
-        raise ValueError("trajectory gradient cannot mix parameters")
-    return TrajectorySemanticGradient(
-        rollout_index=items[0].rollout_index,
-        parameter=parameter,
-        feedback=feedback if feedback is not None else items[0].feedback,
-        rationale=rationale if rationale is not None else items[0].diagnosis,
-        step_indices=tuple(sorted({item.step_index for item in items})),
-        source_count=len(items),
-        total_weight=sum(item.weight for item in items),
-        mean_advantage=fmean(item.advantage for item in items),
-    )
 
 
 def _component_parameters(component: InvocationRef) -> tuple[ParameterRef, ...]:
@@ -998,99 +497,6 @@ def _component_parameters(component: InvocationRef) -> tuple[ParameterRef, ...]:
     raise ValueError(f"unknown invocation kind: {component.kind}")
 
 
-def _trace_parameters(record: AdvantageRecord) -> tuple[ParameterRef, ...]:
-    parameters = [
-        ParameterRef(HarnessComponent.SKILL_DESCRIPTION, record.trace.skill.id),
-        ParameterRef(HarnessComponent.SKILL_STRATEGY, record.trace.skill.id),
-    ]
-    for entry in record.trace.retrieved_memory:
-        parameters.extend(
-            [
-                ParameterRef(HarnessComponent.MEMORY_KEY, entry.id),
-                ParameterRef(HarnessComponent.MEMORY_VALUE, entry.id),
-            ]
-        )
-    return tuple(parameters)
-
-
-def _trace_parameter_value(record: AdvantageRecord, parameter: ParameterRef) -> str:
-    if parameter.component == HarnessComponent.SKILL_DESCRIPTION:
-        return record.trace.skill.description
-    if parameter.component == HarnessComponent.SKILL_STRATEGY:
-        return record.trace.skill.strategy
-    for entry in record.trace.retrieved_memory:
-        if entry.id != parameter.item_id:
-            continue
-        if parameter.component == HarnessComponent.MEMORY_KEY:
-            return entry.key
-        if parameter.component == HarnessComponent.MEMORY_VALUE:
-            return entry.value
-    raise KeyError(parameter)
-
-
-def _record_payload(record: AdvantageRecord) -> dict[str, Any]:
-    trace = record.trace
-    transition = trace.transition
-    return {
-        "rollout_index": record.rollout_index,
-        "step_index": record.step_index,
-        "state_factor_pool": [
-            {"name": factor.name, "expression": factor.expression}
-            for factor in trace.state.factor_pool
-        ],
-        "skill": {
-            "id": trace.skill.id,
-            "description": trace.skill.description,
-            "strategy": trace.skill.strategy,
-        },
-        "memory_query": trace.memory_query,
-        "interaction": [
-            {
-                "role": message.role,
-                "content": message.content,
-                "tool_calls": [
-                    {"name": call.name, "arguments": call.arguments}
-                    for call in message.tool_calls
-                ],
-                "tool_name": message.name,
-                "tool_output": message.output,
-                "tool_error": message.error,
-            }
-            for message in trace.interaction
-        ],
-        "retrieved_memory": [
-            {
-                "id": entry.id,
-                "key": entry.key,
-                "factor_edit": entry.factor_edit,
-                "evaluation": dict(entry.evaluation),
-                "value": entry.value,
-            }
-            for entry in trace.retrieved_memory
-        ],
-        "factor_action": {
-            "operation": trace.action.operation.value,
-            "target": trace.action.target,
-            "factor": (
-                {
-                    "name": trace.action.factor.name,
-                    "expression": trace.action.factor.expression,
-                }
-                if trace.action.factor is not None
-                else None
-            ),
-        },
-        "outcome": {
-            "accepted": transition.accepted,
-            "redundancy": transition.redundancy,
-            "previous_score": transition.previous_score,
-            "next_score": transition.next_score,
-            "reward": transition.reward,
-            "evaluation": dict(transition.info),
-        },
-        "return_to_go": record.return_to_go,
-        "advantage": record.advantage,
-    }
 
 
 def _get_parameter(harness: Harness, parameter: ParameterRef) -> str:

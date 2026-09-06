@@ -18,12 +18,9 @@ from .advantage import (
 from .agent import Agent
 from .harness import Harness
 from .optimization import (
-    AttributedHarnessOptimizationResult,
-    ConflictAwareSemanticGradientEngine,
-    HarnessEditOptimizer,
     HarnessOptimizationResult,
-    SemanticGradientEngine,
-    optimize_harness,
+    ConflictAwareSemanticGradientEngine,
+    HarnessEvolutionOptimizer,
     optimize_harness_with_attribution,
 )
 from .persistence import factor_pool_to_list, save_factor_pool, save_harness, write_json
@@ -59,6 +56,8 @@ class TrainingConfig:
 
 @dataclass(frozen=True)
 class TrainingRound:
+    """One rollout followed by prefill-attributed harness optimization."""
+
     index: int
     run: AgentRun
     advantages: AdvantageBatch
@@ -79,188 +78,12 @@ class TrainingResult:
     harness: Harness
     rounds: tuple[TrainingRound, ...]
     final_factor_pool: FactorPool
-
-
-class HamaTrainer:
-    """Optimize only ``(Omega,E)`` after each rollout."""
-
-    def __init__(
-        self,
-        *,
-        harness: Harness,
-        initial_state: MarketState,
-        task: Any,
-        agent_factory: AgentFactory,
-        environment_factory: TrainingEnvironmentFactory,
-        semantic_engine: SemanticGradientEngine,
-        edit_optimizer: HarnessEditOptimizer,
-        config: TrainingConfig,
-    ) -> None:
-        self.harness = harness
-        self.initial_state = initial_state
-        self.task = task
-        self.agent_factory = agent_factory
-        self.environment_factory = environment_factory
-        self.semantic_engine = semantic_engine
-        self.edit_optimizer = edit_optimizer
-        self.config = config
-
-    def train(self) -> TrainingResult:
-        rounds: list[TrainingRound] = []
-        baseline = EMAReturnBaseline(
-            self.config.baseline_update_rate,
-            self.config.baseline_initial_value,
-            dict(self.config.baseline_initial_values or {}),
-        )
-        current_state = self.initial_state
-        for round_index in range(self.config.rounds):
-            frozen_harness = self.harness
-            environment = self.environment_factory(round_index, current_state)
-            run = rollout(
-                self.task,
-                environment,
-                self.agent_factory(frozen_harness),
-                metadata={"rollout_index": 0, "training_round": round_index},
-            )
-            current_state = (
-                run.traces[-1].next_state if run.traces else environment.state
-            )
-            advantages = estimate_ema_advantages(
-                run,
-                baseline,
-                gamma=self.config.gamma,
-            )
-            optimization = optimize_harness(
-                harness=frozen_harness,
-                batch=advantages,
-                semantic_engine=self.semantic_engine,
-                edit_optimizer=self.edit_optimizer,
-            )
-            record = TrainingRound(round_index, run, advantages, optimization)
-            rounds.append(record)
-            self.harness = optimization.harness
-            self._checkpoint(record)
-        return TrainingResult(self.harness, tuple(rounds), current_state.factor_pool)
-
-    def _checkpoint(self, record: TrainingRound) -> None:
-        if self.config.checkpoint_dir is None:
-            return
-        directory = Path(self.config.checkpoint_dir).resolve()
-        round_directory = directory / f"round-{record.index:04d}"
-        save_harness(record.optimization.harness, round_directory / "harness")
-        write_json(
-            round_directory / "training.json",
-            {
-                "round": record.index,
-                "mean_discounted_return": record.mean_discounted_return,
-                "rollout": {
-                    "stop_reason": record.run.stop_reason,
-                    "steps": record.run.steps,
-                    "rewards": [trace.reward for trace in record.run.traces],
-                    "initial_factor_pool": (
-                        factor_pool_to_list(record.run.traces[0].state.factor_pool)
-                        if record.run.traces
-                        else []
-                    ),
-                    "final_factor_pool": (
-                        factor_pool_to_list(
-                            record.run.traces[-1].next_state.factor_pool
-                        )
-                        if record.run.traces
-                        else []
-                    ),
-                    "usage": record.run.usage,
-                },
-                "advantages": [
-                    {
-                        "rollout_index": item.rollout_index,
-                        "step_index": item.step_index,
-                        "return_to_go": item.return_to_go,
-                        "baseline": item.baseline,
-                        "advantage": item.advantage,
-                    }
-                    for item in record.advantages.records
-                ],
-                "segment_gradients": [
-                    {
-                        "rollout_index": item.rollout_index,
-                        "step_index": item.step_index,
-                        "component": item.parameter.component.value,
-                        "item_id": item.parameter.item_id,
-                        "advantage": item.advantage,
-                        "diagnosis": item.diagnosis,
-                        "feedback": item.feedback,
-                    }
-                    for item in record.optimization.gradients
-                ],
-                "trajectory_gradients": [
-                    {
-                        "rollout_index": item.rollout_index,
-                        "step_indices": list(item.step_indices),
-                        "component": item.parameter.component.value,
-                        "item_id": item.parameter.item_id,
-                        "mean_advantage": item.mean_advantage,
-                        "source_count": item.source_count,
-                        "rationale": item.rationale,
-                        "feedback": item.feedback,
-                    }
-                    for item in record.optimization.trajectory_gradients
-                ],
-                "group_gradients": [
-                    {
-                        "component": item.parameter.component.value,
-                        "item_id": item.parameter.item_id,
-                        "rollout_count": item.source_count,
-                        "segment_count": item.segment_count,
-                        "rationale": item.rationale,
-                        "feedback": item.feedback,
-                    }
-                    for item in record.optimization.aggregated_gradients
-                ],
-                "edits": [
-                    {
-                        "component": edit.parameter.component.value,
-                        "item_id": edit.parameter.item_id,
-                        "before": edit.before,
-                        "after": edit.after,
-                    }
-                    for edit in record.optimization.edits
-                ],
-                "harness_path": "harness",
-            },
-        )
-
-
-@dataclass(frozen=True)
-class AttributedTrainingRound:
-    """One rollout followed by prefill-attributed harness optimization."""
-
-    index: int
-    run: AgentRun
-    advantages: AdvantageBatch
-    optimization: AttributedHarnessOptimizationResult
-
-    @property
-    def mean_discounted_return(self) -> float:
-        returns = [
-            record.return_to_go
-            for record in self.advantages.records
-            if record.step_index == 0
-        ]
-        return fmean(returns) if returns else 0.0
-
-
-@dataclass(frozen=True)
-class AttributedTrainingResult:
-    harness: Harness
-    rounds: tuple[AttributedTrainingRound, ...]
-    final_factor_pool: FactorPool
     best_factor_pool: FactorPool
     best_selection_score: float
     best_round: int
 
 
-class AttributedHamaTrainer:
+class HamaTrainer:
     """End-to-end trainer for advantage-weighted component attribution."""
 
     def __init__(
@@ -273,7 +96,7 @@ class AttributedHamaTrainer:
         environment_factory: TrainingEnvironmentFactory,
         attributor: ComponentAttributor,
         semantic_engine: ConflictAwareSemanticGradientEngine,
-        edit_optimizer: HarnessEditOptimizer,
+        edit_optimizer: HarnessEvolutionOptimizer,
         config: TrainingConfig,
         selection_evaluator: FactorEvaluator | None = None,
         harness_repository: HarnessRepository | None = None,
@@ -290,8 +113,8 @@ class AttributedHamaTrainer:
         self.selection_evaluator = selection_evaluator
         self.harness_repository = harness_repository
 
-    def train(self) -> AttributedTrainingResult:
-        rounds: list[AttributedTrainingRound] = []
+    def train(self) -> TrainingResult:
+        rounds: list[TrainingRound] = []
         best_pool: FactorPool = ()
         best_score = float("-inf")
         best_round = -1
@@ -338,7 +161,7 @@ class AttributedHamaTrainer:
                     semantic_engine=self.semantic_engine,
                     edit_optimizer=self.edit_optimizer,
                 )
-                record = AttributedTrainingRound(
+                record = TrainingRound(
                     round_index, run, advantages, optimization
                 )
                 rounds.append(record)
@@ -365,7 +188,7 @@ class AttributedHamaTrainer:
         finally:
             if writer is not None:
                 writer.close()
-        return AttributedTrainingResult(
+        return TrainingResult(
             self.harness,
             tuple(rounds),
             current_state.factor_pool,
@@ -376,7 +199,7 @@ class AttributedHamaTrainer:
 
     def _select_factor_pool(
         self,
-        record: AttributedTrainingRound,
+        record: TrainingRound,
     ) -> tuple[float, FactorPool, dict[str, Any]] | None:
         if not record.run.traces:
             return None
@@ -412,7 +235,7 @@ class AttributedHamaTrainer:
             },
         )
 
-    def _checkpoint(self, record: AttributedTrainingRound) -> None:
+    def _checkpoint(self, record: TrainingRound) -> None:
         if self.config.checkpoint_dir is None:
             return
         directory = Path(self.config.checkpoint_dir).resolve()
